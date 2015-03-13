@@ -1,0 +1,230 @@
+--- php-5.2.9/ext/curl/interface.c	2009-01-26 10:25:23.000000000 -0500
++++ php-5.2.9/ext/curl/interface.c	2009-04-24 09:55:17.000000000 -0400
+@@ -16,7 +16,7 @@
+    +----------------------------------------------------------------------+
+ */
+ 
+-/* $Id: interface.c,v 1.62.2.14.2.41 2009/01/26 15:25:23 iliaa Exp $ */
++/* $Id: interface.c,v 1.62.2.14.2.44 2009/04/16 09:47:33 pajoye Exp $ */
+ 
+ #define ZEND_INCLUDE_FULL_WINDOWS_HEADERS
+ 
+@@ -147,6 +147,7 @@
+ #endif
+ /* }}} */
+ 
++static void _php_curl_close_ex(php_curl *ch TSRMLS_DC);
+ static void _php_curl_close(zend_rsrc_list_entry *rsrc TSRMLS_DC);
+ 
+ #define SAVE_CURL_ERROR(__handle, __err) (__handle)->err.no = (int) __err;
+@@ -162,31 +163,43 @@
+  #define php_curl_ret(__ret) RETVAL_FALSE; return;
+ #endif
+ 
+-#define PHP_CURL_CHECK_OPEN_BASEDIR(str, len, __ret)													\
+-	if (((PG(open_basedir) && *PG(open_basedir)) || PG(safe_mode)) &&                                                \
+-	    strncasecmp(str, "file:", sizeof("file:") - 1) == 0)								\
+-	{ 																							\
+-		php_url *tmp_url; 																		\
+-															\
+-		if (!(tmp_url = php_url_parse_ex(str, len))) {											\
+-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Invalid URL '%s'", str);				\
+-			php_curl_ret(__ret);											\
+-		} 													\
+-															\
+-		if (tmp_url->host || !php_memnstr(str, tmp_url->path, strlen(tmp_url->path), str + len)) {				\
+-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "URL '%s' contains unencoded control characters", str);	\
+-			php_url_free(tmp_url); 																\
+-			php_curl_ret(__ret);											\
+-		}													\
+-																								\
+-		if (tmp_url->query || tmp_url->fragment || php_check_open_basedir(tmp_url->path TSRMLS_CC) || 									\
+-			(PG(safe_mode) && !php_checkuid(tmp_url->path, "rb+", CHECKUID_CHECK_MODE_PARAM))	\
+-		) { 																					\
+-			php_url_free(tmp_url); 																\
+-			php_curl_ret(__ret);											\
+-		} 																						\
+-		php_url_free(tmp_url); 																	\
++static int php_curl_option_url(php_curl *ch, const char *url, const int len) {
++	CURLcode     error=CURLE_OK;
++#if LIBCURL_VERSION_NUM < 0x071100
++	char *copystr = NULL;
++#endif
++
++	/* Disable file:// if open_basedir or safe_mode are used */
++	if ((PG(open_basedir) && *PG(open_basedir)) || PG(safe_mode)) {
++#if LIBCURL_VERSION_NUM >= 0x071304
++		error = curl_easy_setopt(ch->cp, CURLOPT_PROTOCOLS, CURLPROTO_ALL & ~CURLPROTO_FILE);
++#else
++		php_url *uri;
++
++		if (!(uri = php_url_parse_ex(url, len))) {
++			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Invalid URL '%s'", url);
++			return 0;
++		}
++
++		if (!strncasecmp("file", uri->scheme, sizeof("file"))) {
++			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Protocol 'file' disabled in cURL");
++			php_url_free(uri);
++			return 0;
++		}
++		php_url_free(uri);
++#endif
+ 	}
++	/* Strings passed to libcurl as 'char *' arguments, are copied by the library... NOTE: before 7.17.0 strings were not copied. */
++#if LIBCURL_VERSION_NUM >= 0x071100
++	error = curl_easy_setopt(ch->cp, CURLOPT_URL, url);
++#else
++	copystr = estrndup(url, len);
++	error = curl_easy_setopt(ch->cp, CURLOPT_URL, copystr);
++	zend_llist_add_element(&ch->to_free.str, &copystr);
++#endif
++
++	return (error == CURLE_OK ? 1 : 0);
++}
+ 
+ /* {{{ arginfo */
+ static
+@@ -630,6 +643,24 @@
+ 	REGISTER_CURL_CONSTANT(CURLFTPSSL_ALL);
+ #endif
+ 
++#if LIBCURL_VERSION_NUM >= 0x071304
++	REGISTER_CURL_CONSTANT(CURLOPT_REDIR_PROTOCOLS);
++	REGISTER_CURL_CONSTANT(CURLOPT_PROTOCOLS);
++	REGISTER_CURL_CONSTANT(CURLPROTO_HTTP);
++	REGISTER_CURL_CONSTANT(CURLPROTO_HTTPS);
++	REGISTER_CURL_CONSTANT(CURLPROTO_FTP);
++	REGISTER_CURL_CONSTANT(CURLPROTO_FTPS);
++	REGISTER_CURL_CONSTANT(CURLPROTO_SCP);
++	REGISTER_CURL_CONSTANT(CURLPROTO_SFTP);
++	REGISTER_CURL_CONSTANT(CURLPROTO_TELNET);
++	REGISTER_CURL_CONSTANT(CURLPROTO_LDAP);
++	REGISTER_CURL_CONSTANT(CURLPROTO_LDAPS);
++	REGISTER_CURL_CONSTANT(CURLPROTO_DICT);
++	REGISTER_CURL_CONSTANT(CURLPROTO_FILE);
++	REGISTER_CURL_CONSTANT(CURLPROTO_TFTP);
++	REGISTER_CURL_CONSTANT(CURLPROTO_ALL);
++#endif
++
+ #ifdef PHP_CURL_NEED_OPENSSL_TSL
+ 	if (!CRYPTO_get_id_callback()) {
+ 		int i, c = CRYPTO_num_locks();
+@@ -1102,7 +1133,6 @@
+ 
+ 	if (argc > 0) {
+ 		convert_to_string_ex(url);
+-		PHP_CURL_CHECK_OPEN_BASEDIR(Z_STRVAL_PP(url), Z_STRLEN_PP(url), (void) NULL);
+ 	}
+ 
+ 	cp = curl_easy_init();
+@@ -1140,15 +1170,10 @@
+ #endif
+ 
+ 	if (argc > 0) {
+-#if LIBCURL_VERSION_NUM >= 0x071100
+-		curl_easy_setopt(ch->cp, CURLOPT_URL, Z_STRVAL_PP(url));
+-#else
+-		char *urlcopy;
+-
+-		urlcopy = estrndup(Z_STRVAL_PP(url), Z_STRLEN_PP(url));
+-		curl_easy_setopt(ch->cp, CURLOPT_URL, urlcopy);
+-		zend_llist_add_element(&ch->to_free.str, &urlcopy);
+-#endif
++		if (!php_curl_option_url(ch, Z_STRVAL_PP(url), Z_STRLEN_PP(url))) {
++			_php_curl_close_ex(ch);
++			RETURN_FALSE;
++		}
+ 	}
+ 
+ 	ZEND_REGISTER_RESOURCE(return_value, ch, le_curl);
+@@ -1303,7 +1328,18 @@
+ #if LIBCURL_VERSION_NUM > 0x070b01 /* CURLOPT_TCP_NODELAY is available since curl 7.11.2 */
+ 		case CURLOPT_TCP_NODELAY:
+ #endif
++#if LIBCURL_VERSION_NUM >= 0x71304
++		case CURLOPT_REDIR_PROTOCOLS:
++		case CURLOPT_PROTOCOLS:
++#endif
+ 			convert_to_long_ex(zvalue);
++#if LIBCURL_VERSION_NUM >= 0x71304
++			if (((PG(open_basedir) && *PG(open_basedir)) || PG(safe_mode)) && (Z_LVAL_PP(zvalue) & CURLPROTO_FILE)) {
++					php_error_docref(NULL TSRMLS_CC, E_WARNING, "CURLPROTO_FILE cannot be activated when in safe_mode or an open_basedir is set");
++					RETVAL_FALSE;
++					return 1;
++			}
++#endif
+ 			error = curl_easy_setopt(ch->cp, option, Z_LVAL_PP(zvalue));
+ 			break;
+ 		case CURLOPT_FOLLOWLOCATION:
+@@ -1348,18 +1384,20 @@
+ 			convert_to_string_ex(zvalue);
+ 
+ 			if (option == CURLOPT_URL) {
+-				PHP_CURL_CHECK_OPEN_BASEDIR(Z_STRVAL_PP(zvalue), Z_STRLEN_PP(zvalue), 1);
+-			}
+-
++				if (!php_curl_option_url(ch, Z_STRVAL_PP(zvalue), Z_STRLEN_PP(zvalue))) {
++					RETVAL_FALSE;
++					return 1;
++				}
++			} else {
+ #if LIBCURL_VERSION_NUM >= 0x071100
+-			/* Strings passed to libcurl as ’char *’ arguments, are copied by the library... NOTE: before 7.17.0 strings were not copied. */
+-			error = curl_easy_setopt(ch->cp, option, Z_STRVAL_PP(zvalue));
++				/* Strings passed to libcurl as â€™char *â€™ arguments, are copied by the library... NOTE: before 7.17.0 strings were not copied. */
++				error = curl_easy_setopt(ch->cp, option, Z_STRVAL_PP(zvalue));
+ #else
+-			copystr = estrndup(Z_STRVAL_PP(zvalue), Z_STRLEN_PP(zvalue));
+-			error = curl_easy_setopt(ch->cp, option, copystr);
+-			zend_llist_add_element(&ch->to_free.str, &copystr);
++				copystr = estrndup(Z_STRVAL_PP(zvalue), Z_STRLEN_PP(zvalue));
++				error = curl_easy_setopt(ch->cp, option, copystr);
++				zend_llist_add_element(&ch->to_free.str, &copystr);
+ #endif
+-
++			}
+ 			break;
+ 		}
+ 		case CURLOPT_FILE:
+@@ -1550,6 +1588,7 @@
+ 			} else {
+ #if LIBCURL_VERSION_NUM >= 0x071101
+ 				/* with curl 7.17.0 and later, we can use COPYPOSTFIELDS, but we have to provide size before */
++				convert_to_string_ex(zvalue);
+ 				error = curl_easy_setopt(ch->cp, CURLOPT_POSTFIELDSIZE, Z_STRLEN_PP(zvalue));
+ 				error = curl_easy_setopt(ch->cp, CURLOPT_COPYPOSTFIELDS, Z_STRVAL_PP(zvalue));
+ #else
+@@ -1981,10 +2020,8 @@
+ 
+ /* {{{ _php_curl_close()
+    List destructor for curl handles */
+-static void _php_curl_close(zend_rsrc_list_entry *rsrc TSRMLS_DC)
++static void _php_curl_close_ex(php_curl *ch TSRMLS_DC)
+ {
+-	php_curl *ch = (php_curl *) rsrc->ptr;
+-
+ #if PHP_CURL_DEBUG
+ 	fprintf(stderr, "DTOR CALLED, ch = %x\n", ch);
+ #endif
+@@ -2023,6 +2060,15 @@
+ }	
+ /* }}} */
+ 
++/* {{{ _php_curl_close()
++   List destructor for curl handles */
++static void _php_curl_close(zend_rsrc_list_entry *rsrc TSRMLS_DC)
++{
++	php_curl *ch = (php_curl *) rsrc->ptr;
++	_php_curl_close_ex(ch TSRMLS_CC);
++}	
++/* }}} */
++
+ #endif /* HAVE_CURL */
+ 
+ /*
+@@ -2033,3 +2079,4 @@
+  * vim600: fdm=marker
+  * vim: noet sw=4 ts=4
+  */
++
